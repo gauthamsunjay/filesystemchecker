@@ -9,13 +9,8 @@
 #include "fs.h"
 
 #define PERROR(msg...) fprintf(stderr, msg)
-char arr[8] = { 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01 };
-// #define BITSET(bitmapblocks, blockaddr) (*(bitmapblocks + blockaddr / 8) & (0x80 >> (blockaddr % 8))) 
+char arr[8] = { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 };
 #define BITSET(bitmapblocks, blockaddr) ((*(bitmapblocks + blockaddr / 8)) & (arr[blockaddr % 8])) 
-#define PBITSET(bitmapblocks, blockaddr) printf("blockaddr %u, value %u\n", blockaddr, *(bitmapblocks))
-#define ENABLE_LOGS 0
-
-#define INFO(msg...) if (ENABLE_LOGS) printf(msg)
 
 typedef struct _image_t {
     uint numinodeblocks;
@@ -24,6 +19,7 @@ typedef struct _image_t {
     char *inodeblocks;
     char *bitmapblocks;
     char *datablocks;
+    char *mmapimage;
 } image_t;
 
 int check_inode_type(struct dinode *inode) {
@@ -67,14 +63,12 @@ int check_inode_indirect_blocks(image_t *image, struct dinode *inode) {
         return 1;
     }
 
-    indirectblk = (uint *) (image->datablocks + blockaddr * BSIZE);
+    indirectblk = (uint *) (image->mmapimage + blockaddr * BSIZE);
     for (i = 0; i < NINDIRECT; i++, indirectblk++) {
         blockaddr = *(indirectblk);
         if (blockaddr == 0)
             continue;
         
-        PBITSET(image->bitmapblocks, blockaddr);
-        printf("bit set = %d\n", BITSET(image->bitmapblocks, blockaddr));
         if (blockaddr < 0 || blockaddr >= image->sb->size || !BITSET(image->bitmapblocks, blockaddr)) {
             return 1;
         }
@@ -86,16 +80,10 @@ int inode_test(image_t *image) {
     struct dinode *inode;
     int i;
     int count_not_allocated = 0;
-    //char arr[sizeof(struct dinode)];
 
     inode = (struct dinode *)(image->inodeblocks);
-    //memset(arr, 0, sizeof(struct dinode));
     
     for(i = 0; i < image->sb->ninodes; i++, inode++) {
-        /*if (memcmp(inode, arr, sizeof(struct dinode)) == 0) {
-            count_not_allocated++;
-            continue;
-        }*/
         if (inode->type == 0) {
             count_not_allocated++;
             continue;
@@ -118,8 +106,6 @@ int inode_test(image_t *image) {
         
     }
 
-    INFO("Num allocated = %d\n", image->sb->ninodes - count_not_allocated);
-    INFO("Num not allocated = %d\n", count_not_allocated);
     return 0;
 }
 
@@ -132,7 +118,7 @@ int fsck(char *filename) {
     int rv = 0;
 
     if (fd == -1) {
-		PERROR("image not found\n");
+		PERROR("image not found.\n");
         return 1;
     }
 
@@ -142,20 +128,19 @@ int fsck(char *filename) {
     }
 	
 	mmapimage = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+    image.mmapimage = mmapimage;
 	image.sb = (struct superblock *) (mmapimage + BSIZE);
-	INFO("nblocks = %u, ninodes = %u, size = %u\n", image.sb->nblocks, image.sb->ninodes, image.sb->size);
 
-    image.numinodeblocks = image.sb->ninodes / IPB + 1;
-    image.numbitmapblocks =  (image.sb->nblocks / BPB) + 1;
+    image.numinodeblocks = (image.sb->ninodes / (IPB)) + 1;
+    image.numbitmapblocks =  (image.sb->size / (BPB)) + 1;
     
     image.inodeblocks = (char *) (mmapimage + BSIZE * 2);
     image.bitmapblocks = (char *) (image.inodeblocks + BSIZE * image.numinodeblocks);
     image.datablocks = (char *) (image.bitmapblocks + BSIZE * image.numbitmapblocks);
-    
+
     rv = inode_test(&image); 
     if (rv != 0) 
         goto cleanup;
-
 
     // Free
 cleanup:
@@ -167,7 +152,7 @@ cleanup:
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        printf("Usage: xcheck <file_system_image>\n");
+        PERROR("Usage: xcheck <file_system_image>\n");
         exit(1);
     }
 
