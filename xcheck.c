@@ -15,6 +15,7 @@ char arr[8] = { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 };
 typedef struct _image_t {
     uint numinodeblocks;
     uint numbitmapblocks;
+    uint firstdatablock;
     struct superblock *sb;
     char *inodeblocks;
     char *bitmapblocks;
@@ -43,7 +44,7 @@ int check_inode_direct_blocks(image_t *image, struct dinode *inode) {
         if (blockaddr == 0)
             continue;
         
-        if (blockaddr < 0 || blockaddr >= image->sb->size || !BITSET(image->bitmapblocks, blockaddr)) {
+        if (blockaddr < 0 || blockaddr >= image->sb->size) {
             return 1;
         }
     }
@@ -59,7 +60,7 @@ int check_inode_indirect_blocks(image_t *image, struct dinode *inode) {
     if (blockaddr == 0)
         return 0;
 
-    if (blockaddr < 0 || blockaddr >= image->sb->size || !(BITSET(image->bitmapblocks, blockaddr))) {
+    if (blockaddr < 0 || blockaddr >= image->sb->size) {
         return 1;
     }
 
@@ -69,8 +70,78 @@ int check_inode_indirect_blocks(image_t *image, struct dinode *inode) {
         if (blockaddr == 0)
             continue;
         
-        if (blockaddr < 0 || blockaddr >= image->sb->size || !BITSET(image->bitmapblocks, blockaddr)) {
+        if (blockaddr < 0 || blockaddr >= image->sb->size) {
             return 1;
+        }
+    }
+    return 0;
+}
+
+int check_dir(image_t *image, struct dinode *inode, int inum) {
+    int i, j, pfound, cfound;
+    uint blockaddr;
+    struct dirent *de;
+    pfound = cfound = 0;
+    
+    for (i = 0; i < NDIRECT; i++) {
+        blockaddr = inode->addrs[i];
+        if (blockaddr == 0)
+            continue;
+
+        de = (struct dirent *) (image->mmapimage + blockaddr * BSIZE);
+        for (j = 0; j < DPB; j++, de++) {
+            if (!cfound && strcmp(".", de->name) == 0) {
+                cfound = 1;
+                if (de->inum != inum)
+                    return 1;
+            }
+
+            if (!pfound && strcmp("..", de->name) == 0) {
+                pfound = 1;
+                if (inum != 1 && de->inum == inum)
+                    return 1;
+
+                if (inum == 1 && de->inum != inum)
+                    return 1;
+            }
+
+            if (pfound && cfound)
+                break;
+        }
+
+        if (pfound && cfound)
+            break;
+    }
+
+    if (!pfound || !cfound)
+        return 1;
+
+    return 0;
+}
+
+int check_bitmap_addr(image_t *image, struct dinode *inode) {
+    int i, j;
+    uint blockaddr;
+    uint *indirect;
+
+    for (i = 0; i < (NDIRECT + 1); i++) {
+        blockaddr = inode->addrs[i];
+        if (blockaddr == 0)
+            continue;
+
+        if (!BITSET(image->bitmapblocks, blockaddr))
+            return 1;
+        
+        if (i == NDIRECT) {
+            indirect = (uint *) (image->mmapimage + blockaddr * BSIZE);
+            for (j = 0; j < NINDIRECT; j++, indirect++) {
+                blockaddr = *(indirect);
+                if (blockaddr == 0)
+                    continue;
+
+                if (!BITSET(image->bitmapblocks, blockaddr))
+                    return 1;
+            }
         }
     }
     return 0;
@@ -104,11 +175,138 @@ int inode_test(image_t *image) {
             return 1;
         }
         
+        if (i == 1 && (inode->type != T_DIR || check_dir(image, inode, i) != 0)) {
+            PERROR("ERROR: root directory does not exist.\n");
+            return 1;
+        }
+
+        if (inode->type == T_DIR && check_dir(image, inode, i) != 0) {
+            PERROR("ERROR: directory not properly formatted.\n");
+            return 1;
+        }
+
+        if (check_bitmap_addr(image, inode) != 0) {
+            PERROR("ERROR: address used by inode but marked free in bitmap.\n");
+            return 1;
+        }
+
     }
 
     return 0;
 }
 
+void get_used_dbs(image_t *image, struct dinode *inode, int *used_dbs) {
+    int i, j;
+    uint blockaddr;
+    uint *indirect;
+
+    for (i = 0; i < (NDIRECT + 1); i++) {
+        blockaddr = inode->addrs[i];
+        if (blockaddr == 0)
+            continue;
+
+        used_dbs[blockaddr - image->firstdatablock] = 1;
+        
+        if (i == NDIRECT) {
+            indirect = (uint *) (image->mmapimage + blockaddr * BSIZE);
+            for (j = 0; j < NINDIRECT; j++, indirect++) {
+                blockaddr = *(indirect);
+                if (blockaddr == 0)
+                    continue;
+
+                used_dbs[blockaddr - image->firstdatablock] = 1;
+            }
+        }
+    }
+}
+
+int bitmap_test(image_t *image) {    
+    struct dinode *inode;
+    int i;
+    int used_dbs[image->sb->nblocks];
+    uint blockaddr;
+    memset(used_dbs, 0, image->sb->nblocks * sizeof(int));
+
+    inode = (struct dinode *)(image->inodeblocks);
+    for(i = 0; i < image->sb->ninodes; i++, inode++) {
+        if (inode->type == 0)
+            continue;
+
+        get_used_dbs(image, inode, used_dbs);
+    }
+    
+    for (i = 0; i < image->sb->nblocks; i++) {
+        blockaddr = (uint) (i + image->firstdatablock);
+        if (used_dbs[i] == 0 && BITSET(image->bitmapblocks, blockaddr)) {
+            PERROR("ERROR: bitmap marks block in use but it is not in use.\n");
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+void fill_duaddrs(image_t *image, struct dinode *inode, uint *duaddrs) {
+    int i;
+    uint blockaddr;
+
+    for (i = 0; i < NDIRECT; i++) {
+        blockaddr = inode->addrs[i];
+        if (blockaddr == 0)
+            continue;
+
+        duaddrs[blockaddr - image->firstdatablock]++;
+    }
+}
+
+void fill_iuaddrs(image_t *image, struct dinode *inode, uint *iuaddrs) {
+    int i;
+    uint *indirect;
+    uint blockaddr = inode->addrs[NDIRECT];
+    
+    indirect = (uint *) (image->mmapimage + blockaddr * BSIZE);
+    for (i = 0; i < NINDIRECT; i++, indirect++) {
+        blockaddr = *(indirect);
+        if (blockaddr == 0)
+            continue;
+
+        iuaddrs[blockaddr - image->firstdatablock]++;
+    }
+}
+
+int blockaddrs_test(image_t *image) {
+    struct dinode *inode;
+    int i;
+    uint duaddrs[image->sb->nblocks];
+    memset(duaddrs, 0, sizeof(uint) * image->sb->nblocks);
+
+    uint iuaddrs[image->sb->nblocks];
+    memset(iuaddrs, 0, sizeof(uint) * image->sb->nblocks);
+
+    inode = (struct dinode *)(image->inodeblocks);
+    
+    for(i = 0; i < image->sb->ninodes; i++, inode++) {
+        if (inode->type == 0)
+            continue;
+
+        fill_duaddrs(image, inode, duaddrs);
+        fill_iuaddrs(image, inode, iuaddrs);
+    }
+
+    for (i = 0; i < image->sb->nblocks; i++) {
+        if (duaddrs[i] > 1) {
+            PERROR("ERROR: direct address used more than once.\n");
+            return 1;
+        }
+
+        if (iuaddrs[i] > 1) {
+            PERROR("ERROR: indirect address used more than once.\n");
+            return 1;
+        }
+    }
+
+    return 0;
+}
 
 int fsck(char *filename) {
 	int fd = open(filename, O_RDONLY, 0);
@@ -116,7 +314,7 @@ int fsck(char *filename) {
 	struct stat st;
 	char *mmapimage;
     int rv = 0;
-
+    
     if (fd == -1) {
 		PERROR("image not found.\n");
         return 1;
@@ -137,9 +335,20 @@ int fsck(char *filename) {
     image.inodeblocks = (char *) (mmapimage + BSIZE * 2);
     image.bitmapblocks = (char *) (image.inodeblocks + BSIZE * image.numinodeblocks);
     image.datablocks = (char *) (image.bitmapblocks + BSIZE * image.numbitmapblocks);
+    
+    image.firstdatablock = image.numinodeblocks + image.numbitmapblocks + 2;
+    
 
     rv = inode_test(&image); 
     if (rv != 0) 
+        goto cleanup;
+
+    rv = bitmap_test(&image);
+    if (rv != 0)
+        goto cleanup;
+    
+    rv = blockaddrs_test(&image);
+    if (rv != 0)
         goto cleanup;
 
     // Free

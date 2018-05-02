@@ -56,4 +56,6 @@ struct dirent {
   char name[DIRSIZ];
 };
 
+#define DPB (BSIZE / sizeof(struct dirent))
+
 #endif // _FS_H_
