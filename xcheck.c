@@ -9,8 +9,8 @@
 #include "fs.h"
 
 #define PERROR(msg...) fprintf(stderr, msg)
-char arr[8] = { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 };
-#define BITSET(bitmapblocks, blockaddr) ((*(bitmapblocks + blockaddr / 8)) & (arr[blockaddr % 8])) 
+char bitarr[8] = { 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 };
+#define BITSET(bitmapblocks, blockaddr) ((*(bitmapblocks + blockaddr / 8)) & (bitarr[blockaddr % 8])) 
 
 typedef struct _image_t {
     uint numinodeblocks;
@@ -308,6 +308,90 @@ int blockaddrs_test(image_t *image) {
     return 0;
 }
 
+void traverse_dirs(image_t *image, struct dinode *rootinode, int *inodemap) {
+    int i, j;
+    uint blockaddr;
+    uint *indirect;
+    struct dinode *inode;
+    struct dirent *dir;
+    
+    if (rootinode->type == T_DIR) {
+        for (i = 0; i < NDIRECT; i++) {
+            blockaddr = rootinode->addrs[i];
+            if (blockaddr == 0)
+                continue;
+
+            dir = (struct dirent *) (image->mmapimage + blockaddr * BSIZE);
+            for (j = 0; j < DPB; j++, dir++) {
+                if (dir->inum != 0 && strcmp(dir->name, ".") != 0 && strcmp(dir->name, "..") != 0) {
+                    inode = ((struct dinode *) (image->inodeblocks)) + dir->inum;
+                    inodemap[dir->inum]++;
+                    traverse_dirs(image, inode, inodemap);
+                }
+            }
+        }
+
+        blockaddr = rootinode->addrs[NDIRECT];
+        if (blockaddr != 0) {
+            indirect = (uint *) (image->mmapimage + blockaddr * BSIZE);
+            for (i = 0; i < NINDIRECT; i++, indirect++) {
+                blockaddr = *(indirect);
+                if (blockaddr == 0)
+                    continue;
+
+                dir = (struct dirent *) (image->mmapimage + blockaddr * BSIZE);
+
+                for (j = 0; j < DPB; j++, dir++) {
+                    if (dir->inum != 0 && strcmp(dir->name, ".") != 0 && strcmp(dir->name, "..") != 0) {
+                        inode = ((struct dinode *) (image->inodeblocks)) + dir->inum;
+                        inodemap[dir->inum]++;
+                        traverse_dirs(image, inode, inodemap);
+                    }
+                }
+            }
+        }
+    }
+}
+
+int directory_check(image_t *image) {
+    int i;
+    int inodemap[image->sb->ninodes];
+    memset(inodemap, 0, sizeof(int) * image->sb->ninodes);
+    struct dinode *inode, *rootinode;
+
+    inode = (struct dinode *) (image->inodeblocks);
+    rootinode = ++inode;
+    
+    inodemap[0]++;
+    inodemap[1]++;
+    
+    traverse_dirs(image, rootinode, inodemap);
+    
+    inode++;
+    for (i = 2; i < image->sb->ninodes; i++, inode++) {
+        if (inode->type != 0 && inodemap[i] == 0) {
+            PERROR("ERROR: inode marked use but not found in a directory.\n");
+            return 1;
+        }
+
+        if (inodemap[i] > 0 && inode->type == 0) {
+            PERROR("ERROR: inode referred to in directory but marked free.\n");
+            return 1;
+        }
+
+        if (inode->type == T_FILE && inode->nlink != inodemap[i]) {
+            PERROR("ERROR: bad reference count for file.\n");
+            return 1;
+        }
+    
+        if (inode->type == T_DIR && inodemap[i] > 1) {
+            PERROR("ERROR: directory appears more than once in file system.\n");
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int fsck(char *filename) {
 	int fd = open(filename, O_RDONLY, 0);
     image_t image;
@@ -348,6 +432,10 @@ int fsck(char *filename) {
         goto cleanup;
     
     rv = blockaddrs_test(&image);
+    if (rv != 0)
+        goto cleanup;
+    
+    rv = directory_check(&image);
     if (rv != 0)
         goto cleanup;
 
